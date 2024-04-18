@@ -90,6 +90,7 @@ class Molecule extends THREE.Object3D {
                     shader.vertexShader;
             shader.vertexShader = shader.vertexShader.replace("#include <begin_vertex>", `
           vec3 p = position;
+          time *= 0.05;
           float n = snoise( vec3( p.x*.6 + time*0.2, p.y*0.4 + time*0.3, p.z*.2 + time*0.2) );
           p += n *0.4;
 
