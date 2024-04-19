@@ -1,111 +1,641 @@
 <!DOCTYPE html>
-<html lang="en" >
+<html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <title>CodePen - 3D Circle</title>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/normalize/5.0.0/normalize.min.css">
-<link rel="stylesheet" href="./style.css">
-
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ShaderToyLite</title>
 </head>
 <body>
-<!-- partial:index.partial.html -->
-<script id="webgl-noise" type="x-shader/x-vertex">
+<style>
 
-  vec3 mod289(vec3 x) {
-  return x - floor(x * (1.0 / 289.0)) * 289.0;
+@font-face {
+        font-family: Resrics;
+        src: url(Resrics.otf);
+}
+body, html {
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
 }
 
-vec4 mod289(vec4 x) {
-  return x - floor(x * (1.0 / 289.0)) * 289.0;
+#myCanvas {
+    position: fixed;
+    width: 100vw;
+    height: 100vh;
 }
+#container{
+    position: absolute;
+    width: 100%;
+    height: 100%;
+    display:flex;
+    align-items: center;
+    justify-content: center;
 
-vec4 permute(vec4 x) {
-  return mod289(((x*34.0)+10.0)*x);
 }
+#container h1{
+    color: white;
+    font-family: Resrics;
+    font-size: 4em;
+    justify-content: center;
+    text-align: center;
+    margin-bottom: -50px;
+}
+img{
+    height: 50vh;
+    width: 50vh;
+    box-shadow: 100px;
+}
+</style>
+<canvas id="myCanvas" width="840" height="472"></canvas>
+</body>
+<script>
+//////////////////////////////////////////////////////////
+// ██████   ███████  ███    ██  ██████   ███████  ██████  
+// ██   ██  ██       ████   ██  ██   ██  ██       ██   ██ 
+// ██████   █████    ██ ██  ██  ██   ██  █████    ██████  
+// ██   ██  ██       ██  ██ ██  ██   ██  ██       ██   ██ 
+// ██   ██  ███████  ██   ████  ██████   ███████  ██   ██ 
+                                                 
+function ShaderToyLite(canvasId) {
 
-vec4 taylorInvSqrt(vec4 r)
+var hdr = 
+`#version 300 es
+#ifdef GL_ES
+precision highp float;
+precision highp int;
+precision mediump sampler3D;
+#endif
+#define texture2D texture
+uniform vec3      iResolution;           // viewport resolution (in pixels)
+uniform float     iTime;                 // shader playback time (in seconds)
+uniform float     iTimeDelta;            // render time (in seconds)
+uniform float     iFrameRate;            // shader frame rate
+uniform int       iFrame;                // shader playback frame
+uniform float     iChannelTime[4];       // channel playback time (in seconds)
+uniform vec3      iChannelResolution[4]; // channel resolution (in pixels)
+uniform vec4      iMouse;                // mouse pixel coords. xy: current (if MLB down), zw: click
+uniform sampler2D iChannel0;             // input channel 0
+uniform sampler2D iChannel1;             // input channel 1
+uniform sampler2D iChannel2;             // input channel 2
+uniform sampler2D iChannel3;             // input channel 3
+uniform vec4      iDate;                 // (year, month, day, unixtime in seconds)
+uniform float     iSampleRate;           // sound sample rate (i.e., 44100)
+out vec4          frag_out_color;
+void mainImage( out vec4 c, in vec2 f );
+void main( void )
 {
-  return 1.79284291400159 - 0.85373472095314 * r;
+    vec4 color = vec4(0.0,0.0,0.0,0.0);
+    mainImage( color, gl_FragCoord.xy );
+    frag_out_color = vec4(color);
+}
+`;
+
+const basicVertexShader = 
+`#version 300 es
+#ifdef GL_ES
+precision highp float;
+precision highp int;
+precision mediump sampler3D;
+#endif
+in vec2 vertexInPosition;
+void main() {
+    gl_Position = vec4(vertexInPosition, 0.0, 1.0);
+}
+`;
+
+const quadVertices = new Float32Array([
+    -1.0, -1.0,
+    1.0, -1.0,
+    -1.0,  1.0,
+    1.0,  1.0,
+    -1.0,  1.0,
+    1.0, -1.0
+]);
+
+
+var opts = { alpha: false, 
+             depth: false, 
+             stencil: false, 
+             premultipliedAlpha: false, 
+             antialias: true, 
+             preserveDrawingBuffer: false, 
+             powerPreference: "high-performance" }; 
+
+var gl = document.getElementById(canvasId).getContext('webgl2', opts); 
+
+// timing
+var isPlaying = false;
+var firstDrawTime = 0;
+var prevDrawTime = 0;
+
+// callback
+var onDrawCallback;
+
+// uniforms
+var iFrame = 0;
+var iMouse = {x: 0, y: 0, clickX: 0, clickY: 0};
+
+// shader common source 
+var common = "";
+
+// render passes variables. valid keys:
+//   'A', 'B', 'C', 'D', 'Image' 
+var sourcecode = {};// fragment shader code
+var ichannels = {}; // texture inputs
+var atexture = {};  // front texture (input/output)
+var btexture = {};  // back texture  (input/output)
+var aframebuf = {}; // front buffer (output)
+var bframebuf = {}; // back buffer (output)
+var program = {};   // webgl program
+var location = {}; // uniform location
+var flip = {};      // a b flip
+
+var setup = () => {
+    gl.getExtension( 'OES_texture_float_linear');
+    gl.getExtension( 'OES_texture_half_float_linear');
+    gl.getExtension( 'EXT_color_buffer_float');
+    gl.getExtension( 'WEBGL_debug_shaders');
+
+    ['A', 'B', 'C', 'D', 'Image'].forEach((key) => {
+        sourcecode[key] = "";
+        ichannels[key] = {};
+        program[key] = null;
+        location[key] = {};
+        if (key != 'Image') {
+            atexture[key] = createTexture();
+            btexture[key] = createTexture();
+            aframebuf[key] = createFrameBuffer(atexture[key]);
+            bframebuf[key] = createFrameBuffer(btexture[key]);
+            flip[key] = false;
+        }
+    });
+
+    // bind the geometry
+    quadBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, quadVertices, gl.STATIC_DRAW);
+    
+    // Set viewport size
+    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+
+    var canvas = document.getElementById(canvasId);
+
+    window.addEventListener('resize', function() {
+        gl.canvas.width = canvas.width;
+        gl.canvas.height = canvas.height;
+        gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+    });
+
+    canvas.addEventListener("mousemove", (event) => {
+        iMouse.x = event.offsetX;
+        iMouse.y = canvas.height - event.offsetY;
+    });
+
+    canvas.addEventListener("mousedown", (event) => {
+        iMouse.clickX = event.offsetX;
+        iMouse.clickY = canvas.height - event.offsetY;
+    });
+
+    canvas.addEventListener("mouseup", () => {
+        iMouse.clickX = 0;
+        iMouse.clickY = 0;
+    });
 }
 
-float snoise(vec3 v)
-{
-  const vec2  C = vec2(1.0/6.0, 1.0/3.0) ;
-  const vec4  D = vec4(0.0, 0.5, 1.0, 2.0);
-
-  // First corner
-  vec3 i  = floor(v + dot(v, C.yyy) );
-  vec3 x0 =   v - i + dot(i, C.xxx) ;
-
-  // Other corners
-  vec3 g = step(x0.yzx, x0.xyz);
-  vec3 l = 1.0 - g;
-  vec3 i1 = min( g.xyz, l.zxy );
-  vec3 i2 = max( g.xyz, l.zxy );
-
-  //   x0 = x0 - 0.0 + 0.0 * C.xxx;
-  //   x1 = x0 - i1  + 1.0 * C.xxx;
-  //   x2 = x0 - i2  + 2.0 * C.xxx;
-  //   x3 = x0 - 1.0 + 3.0 * C.xxx;
-  vec3 x1 = x0 - i1 + C.xxx;
-  vec3 x2 = x0 - i2 + C.yyy; // 2.0*C.x = 1/3 = C.y
-  vec3 x3 = x0 - D.yyy;      // -1.0+3.0*C.x = -0.5 = -D.y
-
-  // Permutations
-  i = mod289(i);
-  vec4 p = permute( permute( permute(
-              i.z + vec4(0.0, i1.z, i2.z, 1.0 ))
-            + i.y + vec4(0.0, i1.y, i2.y, 1.0 ))
-            + i.x + vec4(0.0, i1.x, i2.x, 1.0 ));
-
-  // Gradients: 7x7 points over a square, mapped onto an octahedron.
-  // The ring size 17*17 = 289 is close to a multiple of 49 (49*6 = 294)
-  float n_ = 0.142857142857; // 1.0/7.0
-  vec3  ns = n_ * D.wyz - D.xzx;
-
-  vec4 j = p - 49.0 * floor(p * ns.z * ns.z);  //  mod(p,7*7)
-
-  vec4 x_ = floor(j * ns.z);
-  vec4 y_ = floor(j - 7.0 * x_ );    // mod(j,N)
-
-  vec4 x = x_ *ns.x + ns.yyyy;
-  vec4 y = y_ *ns.x + ns.yyyy;
-  vec4 h = 1.0 - abs(x) - abs(y);
-
-  vec4 b0 = vec4( x.xy, y.xy );
-  vec4 b1 = vec4( x.zw, y.zw );
-
-  //vec4 s0 = vec4(lessThan(b0,0.0))*2.0 - 1.0;
-  //vec4 s1 = vec4(lessThan(b1,0.0))*2.0 - 1.0;
-  vec4 s0 = floor(b0)*2.0 + 1.0;
-  vec4 s1 = floor(b1)*2.0 + 1.0;
-  vec4 sh = -step(h, vec4(0.0));
-
-  vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy ;
-  vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww ;
-
-  vec3 p0 = vec3(a0.xy,h.x);
-  vec3 p1 = vec3(a0.zw,h.y);
-  vec3 p2 = vec3(a1.xy,h.z);
-  vec3 p3 = vec3(a1.zw,h.w);
-
-  //Normalise gradients
-  vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2, p2), dot(p3,p3)));
-  p0 *= norm.x;
-  p1 *= norm.y;
-  p2 *= norm.z;
-  p3 *= norm.w;
-
-  // Mix final noise value
-  vec4 m = max(0.5 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
-  m = m * m;
-  return 105.0 * dot( m*m, vec4( dot(p0,x0), dot(p1,x1),
-                                dot(p2,x2), dot(p3,x3) ) );
+var createTexture = () => {
+    var texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, gl.canvas.width, gl.canvas.height, 0, gl.RGBA, gl.FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return texture;
 }
 
+var createFrameBuffer = (texture) => {
+    var framebuffer = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return framebuffer;
+};
+
+var compileProgram = (key) => {
+    var vert = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vert, basicVertexShader);
+    gl.compileShader(vert);
+
+    if (!gl.getShaderParameter(vert, gl.COMPILE_STATUS)) {
+        console.error('Vertex Shader compilation failed: ' + gl.getShaderInfoLog(vert));
+        gl.deleteShader(vert);
+        return null;
+    }
+
+    var source = hdr + common + sourcecode[key];
+    var frag = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(frag, source);
+    gl.compileShader(frag);
+
+    if (!gl.getShaderParameter(frag, gl.COMPILE_STATUS)) {
+        console.error('Fragment Shader compilation failed: ' + gl.getShaderInfoLog(frag));
+        console.error(source);
+        gl.deleteShader(frag);
+        return null;
+    }
+
+    var program = gl.createProgram();
+    gl.attachShader(program, vert);
+    gl.attachShader(program, frag);
+    gl.linkProgram(program);
+
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        console.error('Program initialization failed: ' + gl.getProgramInfoLog(program));
+        return null;
+    }
+
+    // uniform locations
+    location[key]["iResolution"]        = gl.getUniformLocation(program, "iResolution");
+    location[key]["iTime"]              = gl.getUniformLocation(program, "iTime");
+    location[key]["iTimeDelta"]         = gl.getUniformLocation(program, "iTimeDelta");
+    location[key]["iFrameRate"]         = gl.getUniformLocation(program, "iFrameRate");
+    location[key]["iFrame"]             = gl.getUniformLocation(program, "iFrame");
+    location[key]["iChannelTime"]       = gl.getUniformLocation(program, "iChannelTime[0]");
+    location[key]["iChannelResolution"] = gl.getUniformLocation(program, "iChannelResolution[0]");
+    location[key]["iChannel0"]          = gl.getUniformLocation(program, "iChannel0");
+    location[key]["iChannel1"]          = gl.getUniformLocation(program, "iChannel1");
+    location[key]["iChannel2"]          = gl.getUniformLocation(program, "iChannel2");
+    location[key]["iChannel3"]          = gl.getUniformLocation(program, "iChannel3");
+    location[key]["iMouse"]             = gl.getUniformLocation(program, "iMouse");
+    location[key]["iDate"]              = gl.getUniformLocation(program, "iDate");
+    location[key]["iSampleRate"]        = gl.getUniformLocation(program, "iSampleRate");
+    location[key]["vertexInPosition"]   = gl.getAttribLocation(program, "vertexInPosition");
+
+    return program;
+};
+
+var repeat = (times, arr) => {
+    let result = [];
+    for (let i = 0; i < times; i++) {
+        result = [...result, ...arr];
+    }
+    return result;
+}
+
+var setShader = (config, key) => {
+    if (config) {
+        if (config.source) {
+            sourcecode[key] = config.source;
+            program[key] = compileProgram(key);
+            if (program[key] == null) {
+                console.error("Failed to compile " + key);
+            }
+        }
+        for (let i = 0; i < 4; i++) {
+            var s = config[`iChannel${i}`];
+            if (s == "A" || s == "B" || s == "C" || s == "D") {
+                ichannels[key][i] = s;
+            }
+        }
+    } else {
+        sourcecode[key] = "";
+        program[key] = null;
+    }
+};
+
+var draw = () => {
+
+    // current time
+    var now = isPlaying ? Date.now() : prevDrawTime;
+    var date = new Date(now);
+
+    // first draw?
+    if (firstDrawTime == 0) {
+        firstDrawTime = now;
+    }
+
+    // call callback
+    if (onDrawCallback) {
+        onDrawCallback();
+    }
+
+    // time difference between frames in seconds
+    var iTimeDelta = (now - prevDrawTime) * 0.001;
+
+    // time in seconds
+    var iTime = (now - firstDrawTime) * 0.001;
+    var iDate = [date.getFullYear(), date.getMonth(), date.getDate(), date.getTime() * 0.001];
+
+    // channel uniforms
+    var iChannelTimes = new Float32Array(repeat(4, [iTime]));
+    var iChannelResolutions = new Float32Array(repeat(4, [gl.canvas.width, gl.canvas.height, 0]));
+
+    ['A', 'B', 'C', 'D', 'Image'].forEach((key) => {
+
+        if (program[key]) {
+
+            // framebuffer
+            if (key === "Image") {
+                gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            } else {
+                var output = flip[key] ? bframebuf[key] : aframebuf[key];
+                gl.bindFramebuffer(gl.FRAMEBUFFER, output);
+            }
+
+            // textures
+            for (let i = 0; i < 4; i++) {
+                var chkey = ichannels[key][i];
+                if (chkey) {
+                    var input = flip[chkey] ? atexture[chkey] : btexture[chkey];
+                    gl.activeTexture(gl[`TEXTURE${i}`]);
+                    gl.bindTexture(gl.TEXTURE_2D, input);
+                }
+            }
+
+            // program
+            gl.useProgram(program[key]);
+
+            // uniforms
+            gl.uniform3f( location[key]["iResolution"], gl.canvas.width, gl.canvas.height, 1.0);
+            gl.uniform1f( location[key]["iTime"], iTime);
+            gl.uniform1f( location[key]["iTimeDelta"], iTimeDelta);
+            gl.uniform1f( location[key]["iFrameRate"], 60);
+            gl.uniform1i( location[key]["iFrame"], iFrame);
+            gl.uniform1fv(location[key]["iChannelTime"], iChannelTimes);
+            gl.uniform3fv(location[key]["iChannelResolution"], iChannelResolutions);
+            gl.uniform1i( location[key]["iChannel0"], 0);
+            gl.uniform1i( location[key]["iChannel1"], 1);
+            gl.uniform1i( location[key]["iChannel2"], 2);
+            gl.uniform1i( location[key]["iChannel3"], 3);
+            gl.uniform4f( location[key]["iMouse"], iMouse.x, iMouse.y, iMouse.clickX, iMouse.clickY);
+            gl.uniform4f( location[key]["iDate"], iDate[0], iDate[1], iDate[2], iDate[3]);
+            gl.uniform1f( location[key]["iSampleRate"], 44100);
+
+            // viewport
+            gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+        
+            // vertexs
+            gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+            gl.vertexAttribPointer(location[key]["vertexInPosition"], 2, gl.FLOAT, false, 0, 0);
+            gl.enableVertexAttribArray(location[key]["vertexInPosition"]);
+
+            // draw
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+            flip[key] = !flip[key];
+        }
+    });
+
+    // time of last draw
+    prevDrawTime = now;
+
+    // frame counter
+    iFrame++;
+};
+
+// Animation loop
+var animate = () => {
+    if (isPlaying) {
+        draw();
+        requestAnimationFrame(animate);
+    }
+};
+
+this.setCommon = (source) => {
+    if (source === undefined) {source = "";}
+    if (source === null) {source = "";}
+    common = source;
+    ['A', 'B', 'C', 'D', 'Image'].forEach((key) => {
+        if (program[key]) {
+            program[key] = compileProgram(key);
+        }
+    });
+};
+
+this.setBufferA = (config) => {
+    setShader(config, 'A');
+};
+
+this.setBufferB = (config) => {
+    setShader(config, 'B');
+};
+
+this.setBufferC = (config) => {
+    setShader(config, 'C');
+};
+
+this.setBufferD = (config) => {
+    setShader(config, 'D');
+};
+
+this.setImage = (config) => {
+    setShader(config, 'Image');
+};
+
+this.setOnDraw = (callback) => {
+    onDrawCallback = callback;
+}
+
+this.addTexture = (texture, key) => {
+    atexture[key] = texture;
+    btexture[key] = texture;
+    flip[key] = false;
+}
+
+this.getTime = () => {
+    return (prevDrawTime - firstDrawTime) * 0.001;
+}
+
+this.getIsPlaying = () => isPlaying;
+
+this.reset = () => {
+    var now = new Date();
+    firstDrawTime = now;
+    prevDrawTime = now;
+    iFrame = 0;
+    draw();
+}
+
+this.pause = () => {
+    isPlaying = false;
+}
+
+this.play = () => {
+    if (!isPlaying) {
+        isPlaying = true;
+        var now = Date.now();
+        var elapsed = prevDrawTime - firstDrawTime;
+        firstDrawTime = now - elapsed;
+        prevDrawTime = now;
+        animate();
+    }
+}
+
+setup();
+}
 </script>
-<!-- partial -->
-  <script src='https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js'></script><script  src="./script.js"></script>
+<script id="Image" type="x-shader/x-fragment">
+    /*
+    * Copyright 2014 Roman Bobniev (FatumR)
+    * 
+    * Licensed under the Apache License, Version 2.0 (the "License");
+    * you may not use this file except in compliance with the License.
+    * You may obtain a copy of the License at
+    * 
+    *     http://www.apache.org/licenses/LICENSE-2.0
+    * 
+    * Unless required by applicable law or agreed to in writing, software
+    * distributed under the License is distributed on an "AS IS" BASIS,
+    * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    * See the License for the specific language governing permissions and
+    * limitations under the License.
+    */
+   
+   #define OCTAVES  16.0
+   
+   #define LIVE_SMOKE 1
+   
+   float rand(vec2 co){
+      return fract(sin(dot(co.xy ,vec2(12.9898,78.233))) * 43758.5453);
+   }
+   
+   float rand2(vec2 co){
+      return fract(cos(dot(co.xy ,vec2(12.9898,78.233))) * 43758.5453);
+   }
+   
+   // Rough Value noise implementation
+   float valueNoiseSimple(vec2 vl) {
+      float minStep = 1.0 ;
+   
+      vec2 grid = floor(vl);
+      vec2 gridPnt1 = grid;
+      vec2 gridPnt2 = vec2(grid.x, grid.y + minStep);
+      vec2 gridPnt3 = vec2(grid.x + minStep, grid.y);
+      vec2 gridPnt4 = vec2(gridPnt3.x, gridPnt2.y);
+   
+       float s = rand2(grid);
+       float t = rand2(gridPnt3);
+       float u = rand2(gridPnt2);
+       float v = rand2(gridPnt4);
+       
+       float x1 = smoothstep(0., 1., fract(vl.x));
+       float interpX1 = mix(s, t, x1);
+       float interpX2 = mix(u, v, x1);
+       
+       float y = smoothstep(0., 1., fract(vl.y));
+       float interpY = mix(interpX1, interpX2, y);
+       
+       return interpY;
+   }
+   
+   float getLowFreqs()
+   {
+       const int NUM_FREQS = 32;
+       /* Close to the spectrum of the voice frequencies for this song. */
+       const float lowStart = 0.65;
+       const float lowEnd = 0.75;
+       float result = 0.0;
+       
+       for (int i = 0; i < NUM_FREQS; i++)
+       {
+           result += texture(iChannel0,
+                               vec2(lowStart + (lowEnd - lowStart)*float(i)/float(NUM_FREQS - 1),
+                                    0.25)).x;
+       }
+   
+       return smoothstep(0.0, 1.0, (result / float(NUM_FREQS)) * 2.);
+   }
+   
+   float fractalNoise(vec2 vl) {
+       float persistance = 2.0;
+       float amplitude = 0.6;
+       float rez = 0.0;
+       vec2 p = vl;
+       
+       for (float i = 0.0; i < OCTAVES; i++) {
+           rez += amplitude * valueNoiseSimple(p);
+           amplitude /= persistance;
+           p *= persistance;
+       }
+       return rez;
+   }
+   
+   float complexFBM(vec2 p) {
+       float sound = getLowFreqs();
+       float slow = iTime / 16.5;
+       float fast = iTime / 13.35;
+       vec2 offset1 = vec2(slow  , 0.); // Main front
+       vec2 offset2 = vec2(sin(fast )* 0.1, 0.); // sub fronts
+   
+       return 
+   #if LIVE_SMOKE
+           (1. + sound) * 
+   #endif
+           fractalNoise( p + offset1 + fractalNoise(
+                   p + fractalNoise(
+                       p + 2. * fractalNoise(p - offset2)
+                   )
+               )
+           );
+   }
+   
+   
+   void mainImage( out vec4 fragColor, in vec2 fragCoord )
+   {
+       vec2 uv = fragCoord.xy / iResolution.xy;
+      
+       vec3 blueColor = vec3(0.129411765, .607843137, 0.1980392157) * 0.6;
+       vec3 orangeColor2 = vec3(0.0309803922, .0203921569, 0.0015686275);
+       vec3 darkColor = orangeColor2 * 0.12;
+       
+       vec3 rez = mix(orangeColor2, blueColor, complexFBM(uv+ vec2(1.,1.)));
+       rez = mix( darkColor, rez, complexFBM(uv + vec2(-1.,4.)));
+       
+       fragColor = vec4(rez, 1.0);
+       
+   }
+</script>
+<script>
+///////////////////////////////////
+// ███████  ██   ██  ██  ███    ███ 
+// ██       ██   ██  ██  ████  ████ 
+// ███████  ███████  ██  ██ ████ ██ 
+//      ██  ██   ██  ██  ██  ██  ██ 
+// ███████  ██   ██  ██  ██      ██ 
+//
+// on iOS, texelFetch is not supported
+// this is not a perfect solution, but at least gets something drawn
+function isMobileSafari() {
+    return /iPad|iPhone|iPod/.test(window.navigator.userAgent);
+}
+const safariShim = isMobileSafari() == false ? '' : `
+#undef texel
+#define texel(a, p) myTexelFetchiOS(a, Bi(p))
+vec4 myTexelFetchiOS(sampler2D tex, ivec2 coord) {
+    ivec2 texSize = ivec2(iChannelResolution[0].xy);
+    ivec2 clamped = ivec2(clamp(coord.x, 0, texSize.x - 1), clamp(coord.y, 0, texSize.y - 1));
+    vec2 norm = (vec2(clamped) + 0.5) / vec2(texSize);
+    return texture(tex, norm);
+}`;
+////////////////////////////////////////
+//  ███    ███   █████   ██  ███    ██
+//  ████  ████  ██   ██  ██  ████   ██
+//  ██ ████ ██  ███████  ██  ██ ██  ██
+//  ██  ██  ██  ██   ██  ██  ██  ██ ██
+//  ██      ██  ██   ██  ██  ██   ████
+var toy = new ShaderToyLite("myCanvas");
+toy.setImage({source: document.getElementById("Image").innerText});
+toy.play();
+</script>
+<div id="container">
+    <div>
+        <h1>
+            TOTEM
+        </h1>
+        <img src="TotemLogo.png" alt="Totem">
+    </div>
+</div>
 
 </body>
 </html>
